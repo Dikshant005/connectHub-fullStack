@@ -6,7 +6,7 @@ ConnectHub is a full-stack, real-time video conferencing and collaboration platf
 
 ## 🔗 Project Links
 
-* **Live API Server:** `https://connecthub.dikshant-ahalawat.live`
+* **Live Link:** `https://connect-hub-frontend-beryl.vercel.app/`
 * **Original Component Repositories:**
   * Backend: [github.com/Dikshant005/connectHub](https://github.com/Dikshant005/connectHub)
   * Frontend: [github.com/Dikshant005/ConnectHub-frontend](https://github.com/Dikshant005/ConnectHub-frontend)
