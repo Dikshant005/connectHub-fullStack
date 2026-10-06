@@ -1,0 +1,544 @@
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { Room, RoomEvent, RemoteParticipant, Participant, createLocalTracks } from 'livekit-client';
+
+export const useWebRTC = (livekitUrl, token) => {
+    const [room, setRoom] = useState(null);
+    const [localStream, setLocalStream] = useState(null);
+    const [remoteStreams, setRemoteStreams] = useState(new Map());
+    const [localStreamReady, setLocalStreamReady] = useState(false);
+    const [isScreenSharing, setIsScreenSharing] = useState(false);
+    const roomRef = useRef(null);
+
+    useEffect(() => {
+        const connectToLiveKit = async () => {
+            const room = new Room({
+                adaptiveStream: true,
+                dynacast: true,
+                videoCaptureDefaults: {
+                    resolution: { width: 1280, height: 720, frameRate: 30 },
+                },
+                screenShareCaptureDefaults: {
+                    resolution: { width: 1920, height: 1080, frameRate: 30 },
+                    audio: true,
+                },
+                publishDefaults: {
+                    screenShareEncoding: {
+                        maxBitrate: 3000000,
+                        maxFramerate: 30,
+                    },
+                    videoEncoding: {
+                        maxBitrate: 1200000,
+                        maxFramerate: 30,
+                    },
+                },
+            });
+
+            roomRef.current = room;
+            setRoom(room);
+
+            const handleTrackSubscribed = (track, publication, participant) => {
+                if (track.kind === 'video') {
+                    const mediaStream = new MediaStream([track.mediaStreamTrack]);
+                    setRemoteStreams(prev => {
+                        const next = new Map(prev);
+                        next.set(track.sid, { 
+                            stream: mediaStream, 
+                            participant, 
+                            participantName: participant.name || participant.identity,
+                            isScreenShare: track.source === 'screen_share',
+                            kind: track.kind
+                        });
+                        return next;
+                    });
+                }
+
+                if (track.kind === 'audio') {
+                    const audioEl = track.attach();
+                    audioEl.style.display = 'none';
+                    audioEl.setAttribute('data-livekit', 'true');
+                    document.body.appendChild(audioEl);
+                }
+            };
+
+            room.on(RoomEvent.TrackSubscribed, handleTrackSubscribed);
+
+            room.on(RoomEvent.TrackPublished, async (publication, participant) => {
+                if (!publication.isSubscribed) {
+                    await publication.setSubscribed(true);
+                }
+            });
+
+            room.on(RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
+                if (track.kind === 'video') {
+                    setRemoteStreams(prev => {
+                        const next = new Map(prev);
+                        next.delete(track.sid);
+                        return next;
+                    });
+                }
+
+                if (track.kind === 'audio') {
+                    track.detach().forEach(el => el.remove());
+                }
+            });
+
+            room.on(RoomEvent.ParticipantDisconnected, (participant) => {
+                setRemoteStreams(prev => {
+                    const next = new Map(prev);
+                    for (const [sid, data] of next.entries()) {
+                        if (data.participant.identity === participant.identity) {
+                            next.delete(sid);
+                        }
+                    }
+                    return next;
+                });
+
+                participant.audioTrackPublications.forEach(pub => {
+                    if (pub.track) {
+                        pub.track.detach().forEach(el => el.remove());
+                    }
+                });
+            });
+
+            try {
+                await room.connect(livekitUrl, token);
+
+                // Handle existing tracks for late joiners
+                room.remoteParticipants.forEach((participant) => {
+                    participant.trackPublications.forEach((publication) => {
+                        if (publication.isSubscribed && publication.track) {
+                            handleTrackSubscribed(publication.track, publication, participant);
+                        }
+                    });
+                });
+
+                const localTracks = await createLocalTracks({
+                    audio: true,
+                    video: true,
+                });
+
+                const stream = new MediaStream();
+                localTracks.forEach(track => {
+                    stream.addTrack(track.mediaStreamTrack);
+                    room.localParticipant.publishTrack(track);
+                });
+
+                setLocalStream(stream);
+                setLocalStreamReady(true);
+
+            } catch (error) {
+                console.error('Failed to connect to LiveKit:', error);
+            }
+        };
+
+        if (livekitUrl && token) {
+            connectToLiveKit();
+        }
+
+        return () => {
+            if (roomRef.current) {
+                roomRef.current.disconnect();
+                roomRef.current = null;
+            }
+            document.querySelectorAll('audio[data-livekit]').forEach(el => el.remove());
+        };
+    }, [livekitUrl, token]);
+
+   const toggleMic = useCallback(async () => {
+    if (room) {
+        const enabled = !room.localParticipant.isMicrophoneEnabled;
+        await room.localParticipant.setMicrophoneEnabled(enabled);
+        return enabled;
+    }
+}, [room]);
+
+   const toggleVideo = useCallback(async () => {
+    if (room) {
+        const enabled = !room.localParticipant.isCameraEnabled;
+        await room.localParticipant.setCameraEnabled(enabled);
+
+        // ✅ Sync localStream with the new/current track after toggle
+        const cameraPublication = room.localParticipant.getTrackPublication('camera');
+        const newTrack = cameraPublication?.track?.mediaStreamTrack;
+
+        if (newTrack) {
+            setLocalStream(prev => {
+                const updated = new MediaStream();
+                // Keep existing audio tracks
+                if (prev) {
+                    prev.getAudioTracks().forEach(t => updated.addTrack(t));
+                }
+                // Add the fresh video track
+                updated.addTrack(newTrack);
+                return updated;
+            });
+        } else if (!enabled) {
+            // Camera turned off — remove video track from stream
+            setLocalStream(prev => {
+                if (!prev) return prev;
+                const updated = new MediaStream();
+                prev.getAudioTracks().forEach(t => updated.addTrack(t));
+                return updated;
+            });
+        }
+
+        return enabled;
+    }
+}, [room]);
+
+    const toggleScreenShare = useCallback(async () => {
+        if (room) {
+            const enabled = !isScreenSharing;
+            await room.localParticipant.setScreenShareEnabled(enabled, {
+                resolution: { width: 1920, height: 1080, frameRate: 30 },
+                audio: true,
+            });
+            setIsScreenSharing(enabled);
+        }
+    }, [room, isScreenSharing]);
+
+    return {
+        localStream,
+        localStreamReady,
+        remoteStreams: Object.fromEntries(remoteStreams.entries()),
+        remoteNames: {}, // This can be adapted if you pass participant names
+        toggleMic,
+        toggleVideo,
+        isScreenSharing,
+        toggleScreenShare,
+        // Keep the old return values but commented out
+        // peerConnectionsRef: useRef({}),
+        // localStreamRef: useRef(null),
+    };
+};
+
+/*
+// OLD P2P Implementation
+import { useEffect, useRef, useState, useCallback } from 'react';
+
+export const useWebRTC = (socket, roomId, userId, userName) => {
+    const [remoteStreams, setRemoteStreams] = useState({});
+    const [remoteNames, setRemoteNames] = useState({});
+    const [localStreamReady, setLocalStreamReady] = useState(false);
+    const localStreamRef = useRef(null);
+    const peerConnectionsRef = useRef({});
+    const pendingCandidatesRef = useRef({});
+
+    const iceServers = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' },
+            { urls: 'stun:stun3.l.google.com:19302' },
+            { urls: 'stun:stun4.l.google.com:19302' },
+            {
+                urls: 'turn:openrelay.metered.ca:80',
+                username: 'openrelayproject',
+                credential: 'openrelayproject',
+            },
+            {
+                urls: 'turn:openrelay.metered.ca:443',
+                username: 'openrelayproject',
+                credential: 'openrelayproject',
+            },
+            {
+                urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+                username: 'openrelayproject',
+                credential: 'openrelayproject',
+            },
+        ],
+        sdpSemantics: 'unified-plan',
+        iceCandidatePoolSize: 10,
+    };
+
+    const handleUserDisconnected = useCallback((remoteUserId) => {
+        if (peerConnectionsRef.current[remoteUserId]) {
+            try {
+                peerConnectionsRef.current[remoteUserId].close();
+            } catch (e) {
+                console.error("Error closing PC", e);
+            }
+            delete peerConnectionsRef.current[remoteUserId];
+        }
+        if (pendingCandidatesRef.current[remoteUserId]) {
+            delete pendingCandidatesRef.current[remoteUserId];
+        }
+        setRemoteStreams((prev) => {
+            const next = { ...prev };
+            delete next[remoteUserId];
+            return next;
+        });
+        setRemoteNames((prev) => {
+            const next = { ...prev };
+            delete next[remoteUserId];
+            return next;
+        });
+    }, []);
+
+    useEffect(() => {
+        let mounted = true;
+        const getLocalStream = async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+                    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+                });
+
+                if (!mounted) {
+                    stream.getTracks().forEach((t) => t.stop());
+                    return;
+                }
+
+                localStreamRef.current = stream;
+                setLocalStreamReady(true);
+            } catch (err) {
+                alert('Cannot access camera/microphone. Please grant permissions and reload the page.');
+            }
+        };
+
+        getLocalStream();
+
+        return () => {
+            mounted = false;
+            if (localStreamRef.current) {
+                localStreamRef.current.getTracks().forEach((t) => t.stop());
+            }
+            Object.values(peerConnectionsRef.current).forEach((pc) => {
+                try { pc.close(); } catch (e) { }
+            });
+        };
+    }, []);
+
+    useEffect(() => {
+        if (!socket || !roomId || !userId) return;
+
+        const createPeerConnection = (remoteUserId) => {
+            if (peerConnectionsRef.current[remoteUserId]) {
+                return peerConnectionsRef.current[remoteUserId];
+            }
+
+            const pc = new RTCPeerConnection(iceServers);
+            peerConnectionsRef.current[remoteUserId] = pc;
+
+            if (localStreamRef.current) {
+                localStreamRef.current.getTracks().forEach((track) => {
+                    try {
+                        pc.addTrack(track, localStreamRef.current);
+                    } catch (err) {
+                        console.warn('addTrack failed:', err);
+                    }
+                });
+            }
+
+            pc.ontrack = (event) => {
+                const { streams, track } = event;
+                setRemoteStreams((prev) => {
+                    const existingStream = prev[remoteUserId];
+                    if (streams && streams[0]) {
+                        if (!existingStream) {
+                            return { ...prev, [remoteUserId]: streams[0] };
+                        } else {
+                            streams[0].getTracks().forEach(t => {
+                                if (!existingStream.getTracks().find(et => et.id === t.id)) {
+                                    existingStream.addTrack(t);
+                                }
+                            });
+                            return { ...prev, [remoteUserId]: new MediaStream(existingStream.getTracks()) };
+                        }
+                    } else {
+                        const stream = existingStream || new MediaStream();
+                        if (track && !stream.getTracks().find(t => t.id === track.id)) {
+                            stream.addTrack(track);
+                        }
+                        return { ...prev, [remoteUserId]: new MediaStream(stream.getTracks()) };
+                    }
+                });
+            };
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    const candidate = (typeof event.candidate.toJSON === 'function')
+                        ? event.candidate.toJSON()
+                        : event.candidate;
+                    socket.emit('ice-candidate', {
+                        toUserId: remoteUserId,
+                        fromUserId: userId,
+                        candidate,
+                    });
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                const state = pc.connectionState;
+                if (state === 'failed') {
+                    handleUserDisconnected(remoteUserId);
+                }
+            };
+
+            return pc;
+        };
+
+        const drainCandidates = async (remoteUserId) => {
+            const pc = peerConnectionsRef.current[remoteUserId];
+            const queue = pendingCandidatesRef.current[remoteUserId];
+            if (pc && pc.remoteDescription && queue && queue.length > 0) {
+                while (queue.length > 0) {
+                    const candidate = queue.shift();
+                    try {
+                        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                    } catch (err) {
+                        console.error(" Error adding drained candidate:", err);
+                    }
+                }
+            }
+        };
+
+        const handleUserConnected = async (payload) => {
+            const remoteId = typeof payload === 'string' ? payload : payload.userId;
+
+            if (!remoteId || remoteId === userId) return;
+
+            // Fix: Ensure any previous connection for this user is fully cleaned up before re-connecting
+            handleUserDisconnected(remoteId);
+
+            const pc = createPeerConnection(remoteId);
+            try {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                // Send name along with the offer
+                socket.emit('signal', remoteId, {
+                    type: offer.type,
+                    sdp: offer.sdp,
+                    senderName: userName
+                });
+            } catch (err) {
+                console.error('Error creating/sending offer to', remoteId, err);
+            }
+        };
+
+        const handleSignal = async (fromUserId, data) => {
+            if (!fromUserId || !data || fromUserId === userId) return;
+
+            // Capture name if provided in signaling data
+            if (data.senderName) {
+                setRemoteNames(prev => ({ ...prev, [fromUserId]: data.senderName }));
+            }
+
+            let pc = peerConnectionsRef.current[fromUserId];
+            if (data.type === 'offer') {
+                if (!pc) pc = createPeerConnection(fromUserId);
+                try {
+                    await pc.setRemoteDescription(new RTCSessionDescription(data));
+                    await drainCandidates(fromUserId);
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    // Send name back along with the answer
+                    socket.emit('signal', fromUserId, {
+                        type: 'answer',
+                        sdp: answer.sdp,
+                        senderName: userName
+                    });
+                } catch (err) {
+                    console.error('Error handling offer:', err);
+                }
+            } else if (data.type === 'answer') {
+                if (!pc) return;
+                try {
+                    await pc.setRemoteDescription(new RTCSessionDescription(data));
+                    await drainCandidates(fromUserId);
+                } catch (err) {
+                    console.error('Error applying answer:', err);
+                }
+            }
+        };
+
+        const handleIceCandidate = async (payload) => {
+            const { fromUserId, candidate } = payload || {};
+            if (!candidate || !fromUserId) return;
+
+            const pc = peerConnectionsRef.current[fromUserId];
+
+            if (pc && pc.remoteDescription) {
+                try {
+                    await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                } catch (err) {
+                    console.error('Error adding ICE candidate:', err);
+                }
+            } else {
+                if (!pendingCandidatesRef.current[fromUserId]) {
+                    pendingCandidatesRef.current[fromUserId] = [];
+                }
+                pendingCandidatesRef.current[fromUserId].push(candidate);
+            }
+        };
+
+        const onUserLeft = (data) => {
+            const leaverId = (typeof data === 'object' && data !== null) ? data.userId : data;
+            if (leaverId) {
+                handleUserDisconnected(leaverId);
+            }
+        };
+
+        socket.on('user-connected', handleUserConnected);
+        socket.on('signal', handleSignal);
+        socket.on('ice-candidate', handleIceCandidate);
+        socket.on('user-disconnected', onUserLeft);
+        socket.on('user-left', onUserLeft);
+
+        return () => {
+            socket.off('user-connected', handleUserConnected);
+            socket.off('signal', handleSignal);
+            socket.off('ice-candidate', handleIceCandidate);
+            socket.off('user-disconnected', onUserLeft);
+            socket.off('user-left', onUserLeft);
+        };
+    }, [socket, roomId, userId, userName, handleUserDisconnected]);
+
+    useEffect(() => {
+        if (!socket || !roomId || !userId || !localStreamReady) return;
+        const handleJoin = () => {
+            socket.emit('join-room', roomId, userId, userName);
+        };
+        if (socket.connected) {
+            handleJoin();
+        }
+        socket.on('connect', handleJoin);
+        return () => {
+            socket.off('connect', handleJoin);
+        };
+    }, [socket, roomId, userId, userName, localStreamReady]);
+
+    const toggleMic = useCallback(() => {
+        if (localStreamRef.current) {
+            const track = localStreamRef.current.getAudioTracks()[0];
+            if (track) {
+                track.enabled = !track.enabled;
+                return track.enabled;
+            }
+        }
+        return true;
+    }, []);
+
+    const toggleVideo = useCallback(() => {
+        if (localStreamRef.current) {
+            const track = localStreamRef.current.getVideoTracks()[0];
+            if (track) {
+                track.enabled = !track.enabled;
+                return track.enabled;
+            }
+        }
+        return true;
+    }, []);
+
+    return {
+        localStream: localStreamRef.current,
+        localStreamReady,
+        remoteStreams,
+        remoteNames,
+        toggleMic,
+        toggleVideo,
+        peerConnectionsRef,
+        localStreamRef,
+    };
+};
+*/

@@ -1,0 +1,50 @@
+import React, { useMemo, useEffect } from "react";
+import { io } from "socket.io-client";
+import { SocketContext } from "../Hooks/useSocket";
+import { getLoginToken } from "../utils/auth";
+
+export const SocketProvider = (props) => {
+    const socket = useMemo(() => {
+        const socketInstance = io('https://connecthub.dikshant-ahalawat.live', {
+            auth: (cb) => {
+                cb({ token: getLoginToken() });
+            },
+            autoConnect: false,
+        });
+
+        return socketInstance;
+    }, []);
+
+    useEffect(() => {
+        const token = getLoginToken();
+
+        if (token) {
+            socket.connect();
+
+            socket.on('connect_error', (error) => {
+                if (error.message === 'Authentication error: Invalid token' ||
+                    error.message === 'Authentication error: No token provided') {
+                    localStorage.removeItem('loginToken');
+                }
+            });
+        }
+
+        return () => {
+            socket.off('connect');
+            socket.off('connect_error');
+            socket.off('disconnect');
+            socket.io.off('reconnect_attempt');
+            socket.io.off('reconnect');
+            socket.io.off('reconnect_error');
+            socket.io.off('reconnect_failed');
+
+            socket.disconnect();
+        };
+    }, [socket]);
+
+    return (
+        <SocketContext.Provider value={{ socket }}>
+            {props.children}
+        </SocketContext.Provider>
+    );
+};
